@@ -8,7 +8,7 @@
 //   兜底: 环境变量 MIMO_COOKIES 指定 cookies-plain.json 文件模式(自动监视变更)
 //
 // 协议面:
-//   OpenAI:    GET /v1/models, POST /v1/chat/completions(流式/非流式)
+//   OpenAI:    GET /v1/models, POST /v1/chat/completions(流式/非流式), POST /v1/responses, POST /v1/images/generations(文生图)
 //   Anthropic: POST /v1/messages(流式 SSE/非流式), POST /v1/messages/count_tokens
 //   其他:      GET /health(含凭据状态)
 //
@@ -38,6 +38,10 @@ const REAL_MODEL = 'mimo-pro'; // 默认:客户端传无法识别的名字时回
 const UPSTREAM_MODELS = ['mimo-pro', 'mimo-flash', 'mimo-v2.6-pro', 'mimo-v2.6-flash'];
 // /v1/models 只展示云端真实名单;名单外的客户端模型名由 resolveModel 静默回落到 mimo-pro
 const MODEL_ALIASES = [...UPSTREAM_MODELS];
+// 图像生成:独立端点(与 chat 同一套 passToken Cookie 鉴权 + X-Mimo-Source 头),实测 2026-09-24 出图正常
+const UPSTREAM_IMAGES = 'https://mimo-server-cn.xiaomimimo.com/api/route/images/generations';
+const IMAGE_MODELS = ['Doubao-Seedream-5.0-pro'];
+function resolveImageModel(m) { return IMAGE_MODELS.includes(m) ? m : IMAGE_MODELS[0]; }
 function resolveModel(m) { return UPSTREAM_MODELS.includes(m) ? m : REAL_MODEL; }
 
 function log(msg) {
@@ -224,7 +228,7 @@ async function refreshSession(allowReextract) {
   })().finally(() => { refreshing = null; });
   return refreshing;
 }
-async function upstream(payload, retried) {
+async function upstream(payload, retried, target, extraHeaders) {
   // 超时分两段:连接+首字节 180s(云端排队容忍);拿到响应头后解除总时限,
   // 流式 body 由 anthropicStream 的 idle 看门狗保护,非流式 body 由调用方 race 超时保护。
   // 旧实现 AbortSignal.timeout 覆盖整个流式生命周期,长响应 180s 必断连。
@@ -232,9 +236,9 @@ async function upstream(payload, retried) {
   const ttfb = setTimeout(() => ctrl.abort(), 180000);
   let resp;
   try {
-    resp = await fetch(UPSTREAM, {
+    resp = await fetch(target || UPSTREAM, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: cookieHeader('mimo-server-cn.xiaomimimo.com') },
+      headers: { 'Content-Type': 'application/json', Cookie: cookieHeader('mimo-server-cn.xiaomimimo.com'), ...(extraHeaders || {}) },
       body: JSON.stringify(payload),
       signal: ctrl.signal
     });
@@ -243,7 +247,7 @@ async function upstream(payload, retried) {
   if ((resp.status === 401 || resp.status === 403) && !retried) {
     log('upstream ' + resp.status + ' -> refreshing session and retrying');
     await refreshSession();
-    return upstream(payload, true);
+    return upstream(payload, true, target, extraHeaders);
   }
   return resp;
 }
@@ -625,7 +629,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && url === '/v1/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data: MODEL_ALIASES.map(id => ({ id, object: 'model', created: 1700000000, owned_by: 'xiaomi-mimo-relay' })) }));
+    res.end(JSON.stringify({ object: 'list', data: [...MODEL_ALIASES, ...IMAGE_MODELS].map(id => ({ id, object: 'model', created: 1700000000, owned_by: 'xiaomi-mimo-relay' })) }));
     return;
   }
   if (req.method === 'GET' && (url === '/health' || url === '/v1/health')) {
@@ -635,6 +639,30 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
     readBody(req, res, p => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(roughCountTokens(p))); });
+    return;
+  }
+  if (req.method === 'POST' && url === '/v1/images/generations') {
+    readBody(req, res, async payload => {
+      // OpenAI images API 兼容透传:model 名单外静默回落 Seedream(同 chat 的 resolveModel 哲学),
+      // 其余字段(prompt/size/n/response_format 等)原样上行。桌面端同款请求需带 X-Mimo-Source。
+      const body = { ...(payload || {}), model: resolveImageModel(payload && payload.model) };
+      try {
+        const up = await upstream(body, false, UPSTREAM_IMAGES, { 'X-Mimo-Source': 'mimocode-desktop' });
+        if (up.ok) {
+          // 出图耗时实测 ~37s,b64_json 模式 body 可达数 MB:600s race 超时
+          const j = await Promise.race([up.json(), new Promise((_, rej) => setTimeout(() => rej(new Error('upstream body timeout (600s)')), 600000))]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(j));
+          return;
+        }
+        res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+        if (up.body) { for await (const chunk of up.body) res.write(chunk); }
+        res.end();
+      } catch (e) {
+        if (!res.headersSent) res.writeHead(502);
+        res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+      }
+    });
     return;
   }
   if (req.method === 'POST' && url === '/v1/responses') {

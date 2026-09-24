@@ -52,9 +52,25 @@ env_key = "MIMO_API_KEY"   # 任意非空值,如 set MIMO_API_KEY=mimo
 | GET | `/v1/models` | 模型列表(别名) |
 | POST | `/v1/chat/completions` | OpenAI 聊天,流式/非流式,tools 透传 |
 | POST | `/v1/responses` | OpenAI Responses API(Codex 新版),流式/非流式,function_call 完整支持 |
+| POST | `/v1/images/generations` | OpenAI 图像 API(Doubao-Seedream-5.0-pro 文生图) |
 | POST | `/v1/messages` | Anthropic Messages,流式 SSE/非流式,完整 tool_use 支持 |
 | POST | `/v1/messages/count_tokens` | 粗略 token 估算 |
 | GET | `/health` | 状态(含凭据来源) |
+
+## 图像生成(文生图)
+
+`POST /v1/images/generations` 走 MiMo 云端独立的图像端点(与聊天同一套订阅鉴权),模型固定 `Doubao-Seedream-5.0-pro`,`model` 字段任意填(名单外自动回落,填 `dall-e-3` 也能出图):
+
+```
+curl http://127.0.0.1:8317/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"Doubao-Seedream-5.0-pro\",\"prompt\":\"一只橘猫在键盘上睡觉,像素风\"}"
+# -> {"model":"doubao-seedream-5-0-pro-...","created":...,"data":[{"url":"https://...TOS 签名直链..."}],"usage":{...}}
+```
+
+- 出图耗时实测 **~40 秒**,客户端超时请放宽到 ≥120s
+- 响应为标准 OpenAI images 结构,`data[0]` 含 `url`(火山 TOS 签名直链,需二次下载)或 `b64_json`
+- `size`/`n` 等其余字段原样透传上游
 
 ## Claude Code 适配细节
 

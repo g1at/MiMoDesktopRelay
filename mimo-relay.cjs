@@ -275,19 +275,38 @@ function anthropicToOpenAI(body) {
       msgs.push(msg);
       continue;
     }
-    // user 消息:可能混有 text 与 tool_result;tool_result 拆成独立 role:tool 消息(OpenAI 语序)
+    // user 消息:可能混有 text 与 tool_result;tool_result 拆成独立 role:tool 消息(OpenAI 语序),
+    // image -> image_url part(多模态);flush 保持块内原始时序(text 在 tool_result 前时不会被翻到后面)
     if (Array.isArray(m.content)) {
-      const texts = [];
+      let texts = [], images = [];
+      const flush = () => {
+        if (!texts.length && !images.length) return;
+        if (!images.length) { msgs.push({ role: 'user', content: texts.join('\n') }); }
+        else {
+          const content = [];
+          const t = texts.join('\n'); if (t) content.push({ type: 'text', text: t });
+          msgs.push({ role: 'user', content: content.concat(images) });
+        }
+        texts = []; images = [];
+      };
       for (const b of m.content) {
         if (!b) continue;
         if (b.type === 'tool_result') {
+          flush();
           let c = b.content;
-          if (Array.isArray(c)) c = c.map(x => (x && x.text) || (typeof x === 'string' ? x : '')).filter(Boolean).join('\n');
+          if (Array.isArray(c)) c = c.map(x => (x && x.text) || (x && x.type === 'image' ? '[image]' : typeof x === 'string' ? x : '')).filter(Boolean).join('\n');
           msgs.push({ role: 'tool', tool_call_id: b.tool_use_id, content: String(c ?? '') });
-        } else if (b.type === 'text') texts.push(b.text || '');
-        else if (b.type === 'image') texts.push('[image]');
+        }
+        else if (b.type === 'text') texts.push(b.text || '');
+        else if (b.type === 'image') {
+          const s = b.source || {};
+          if (s.type === 'base64' && s.data) images.push({ type: 'image_url', image_url: { url: `data:${s.media_type || 'image/png'};base64,${s.data}` } });
+          else if (s.type === 'url' && s.url) images.push({ type: 'image_url', image_url: { url: s.url } });
+          else texts.push('[image]');
+        }
+        else if (b.type === 'document') texts.push('[document]');
       }
-      if (texts.length) msgs.push({ role: 'user', content: texts.join('\n') });
+      flush();
     } else {
       msgs.push({ role: 'user', content: String(m.content ?? '') });
     }
@@ -297,30 +316,48 @@ function anthropicToOpenAI(body) {
   if (body.temperature != null) out.temperature = body.temperature;
   if (body.top_p != null) out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences;
+  // thinking.budget_tokens -> reasoning_effort(上游已实测接受该字段;disabled -> low)
+  if (body.thinking) {
+    if (body.thinking.type === 'enabled') {
+      const b = body.thinking.budget_tokens || 0;
+      out.reasoning_effort = b && b < 4096 ? 'low' : b && b < 16384 ? 'medium' : 'high';
+    } else if (body.thinking.type === 'disabled') out.reasoning_effort = 'low';
+  }
   if (Array.isArray(body.tools) && body.tools.length) {
-    out.tools = body.tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } } }));
+    // 仅自定义工具可映射为 OpenAI function;服务端工具(web_search 等)上游不支持,丢弃
+    const tools = body.tools.filter(t => t && (!t.type || t.type === 'custom'));
+    if (tools.length) out.tools = tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } } }));
     const tc = body.tool_choice;
     if (tc) out.tool_choice = tc.type === 'auto' ? 'auto' : tc.type === 'any' ? 'required' : (tc.type === 'tool' && tc.name ? { type: 'function', function: { name: tc.name } } : 'auto');
   }
   return out;
 }
+// Anthropic usage:补 cache 字段(上游 prompt_tokens_details.cached_tokens -> cache_read_input_tokens)
+function anthUsage(u) {
+  u = u || {}; const pd = u.prompt_tokens_details || {};
+  return { input_tokens: u.prompt_tokens || 0, output_tokens: u.completion_tokens || 0, cache_creation_input_tokens: 0, cache_read_input_tokens: pd.cached_tokens || 0 };
+}
+const genSig = () => crypto.randomBytes(96).toString('base64');
 function openAIToAnthropic(oai, clientModel) {
   const choice = (oai.choices && oai.choices[0]) || {};
   const message = choice.message || {};
   const content = [];
+  // reasoning_content -> thinking 块(带 signature;回传历史时客户端会原样带回,转换层会丢弃不参与上送)
+  if (message.reasoning_content) content.push({ type: 'thinking', thinking: message.reasoning_content, signature: genSig() });
   if (message.content) content.push({ type: 'text', text: message.content });
   for (const tc of message.tool_calls || []) {
     let input = {};
     try { input = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch {}
     content.push({ type: 'tool_use', id: tc.id || ('toolu_' + crypto.randomBytes(8).toString('hex')), name: (tc.function && tc.function.name) || '', input });
   }
+  if (!content.length) content.push({ type: 'text', text: '' });
   return {
     id: 'msg_' + crypto.randomBytes(12).toString('hex'),
     type: 'message', role: 'assistant', model: clientModel || REAL_MODEL,
     content,
     stop_reason: mapFinishReason(choice.finish_reason),
     stop_sequence: null,
-    usage: { input_tokens: (oai.usage && oai.usage.prompt_tokens) || 0, output_tokens: (oai.usage && oai.usage.completion_tokens) || 0 }
+    usage: anthUsage(oai.usage)
   };
 }
 function sseWrite(res, event, data) { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
@@ -328,13 +365,20 @@ async function anthropicStream(res, up, clientModel) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   sseWrite(res, 'message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model: clientModel || REAL_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-  let outTokens = 0, inTokens = 0, stopReason = 'end_turn';
-  // block 状态机:任意时刻最多一个 block 开着;text 与 tool_use 切换时先关后开
-  let blockOpen = false, blockIndex = -1;
+  let outTokens = 0, inTokens = 0, cachedTokens = 0, stopReason = 'end_turn';
+  // block 状态机:任意时刻最多一个 block 开着;text/thinking/tool_use 切换时先关后开
+  let blockOpen = false, blockIndex = -1, blockType = null;
   const tcMap = new Map(); // OpenAI tool_calls index -> Anthropic blockIndex
   const closeBlock = () => {
-    if (blockOpen) { try { sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex }); } catch {} blockOpen = false; }
+    if (!blockOpen) return;
+    try {
+      // thinking 块收尾须先补 signature_delta(Anthropic 流式协议要求)
+      if (blockType === 'thinking') sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'signature_delta', signature: genSig() } });
+      sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    } catch {}
+    blockOpen = false; blockType = null;
   };
+  const openBlock = (type, cb) => { closeBlock(); blockIndex++; blockType = type; blockOpen = true; sseWrite(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: cb }); };
   // 保活与看门狗:云端长推理期间定期 ping;超过 150s 无任何数据则判死断开(告别假断连)
   let lastChunk = Date.now(), finished = false;
   const pingTimer = setInterval(() => { try { sseWrite(res, 'ping', { type: 'ping' }); } catch {} }, 15000);
@@ -360,33 +404,43 @@ async function anthropicStream(res, up, clientModel) {
         let j; try { j = JSON.parse(data); } catch { continue; }
         const ch = (j.choices && j.choices[0]) || {};
         const delta = ch.delta || {};
+        // reasoning_content -> thinking 块(thinking_delta 增量)
+        if (delta.reasoning_content) {
+          if (!blockOpen || blockType !== 'thinking') openBlock('thinking', { type: 'thinking', thinking: '' });
+          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
+        }
         if (delta.content) {
-          if (!blockOpen) { blockIndex++; blockOpen = true; sseWrite(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } }); }
+          if (!blockOpen || blockType !== 'text') openBlock('text', { type: 'text', text: '' });
           sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } });
         }
         for (const tc of delta.tool_calls || []) {
           const ti = tc.index != null ? tc.index : 0;
           let entry = tcMap.get(ti);
+          // 先占位(关闭前一个块),content_block_start 延迟到 id/name 到达再发
           if (!entry) { closeBlock(); blockIndex++; entry = { blockIndex, started: false }; tcMap.set(ti, entry); }
           if (!entry.started && (tc.id || (tc.function && tc.function.name))) {
             sseWrite(res, 'content_block_start', { type: 'content_block_start', index: entry.blockIndex, content_block: { type: 'tool_use', id: tc.id || ('toolu_' + crypto.randomBytes(8).toString('hex')), name: (tc.function && tc.function.name) || '', input: {} } });
-            entry.started = true; blockOpen = true; blockIndex = entry.blockIndex;
+            entry.started = true; blockOpen = true; blockType = 'tool_use'; blockIndex = entry.blockIndex;
           }
           if (entry.started && tc.function && tc.function.arguments) {
             sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: entry.blockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } });
           }
         }
         if (ch.finish_reason) stopReason = mapFinishReason(ch.finish_reason);
-        if (j.usage) { inTokens = j.usage.prompt_tokens || inTokens; outTokens = j.usage.completion_tokens || outTokens; }
+        if (j.usage) { const u = anthUsage(j.usage); inTokens = u.input_tokens || inTokens; outTokens = u.output_tokens || outTokens; cachedTokens = u.cache_read_input_tokens || cachedTokens; }
       }
       if (done) break;
     }
-  } catch (e) { log('stream error: ' + e.message); }
+  } catch (e) {
+    log('stream error: ' + e.message);
+    // 流式中途异常:补 SSE error 事件,客户端可识别并走重试
+    try { sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: String((e && e.message) || e) } }); } catch {}
+  }
   finished = true;
   clearInterval(pingTimer); clearInterval(idleTimer);
   closeBlock();
   try {
-    sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inTokens, output_tokens: outTokens } });
+    sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inTokens, output_tokens: outTokens, cache_creation_input_tokens: 0, cache_read_input_tokens: cachedTokens } });
     sseWrite(res, 'message_stop', { type: 'message_stop' });
     res.end();
   } catch {}
@@ -548,8 +602,13 @@ async function responsesStream(res, up, clientModel) {
 function roughCountTokens(body) {
   let chars = 0;
   if (body.system) chars += typeof body.system === 'string' ? body.system.length : JSON.stringify(body.system).length;
+  if (body.tools) chars += JSON.stringify(body.tools).length;
   for (const m of body.messages || []) chars += typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
   return { input_tokens: Math.max(1, Math.ceil(chars / 3)) };
+}
+// Anthropic 错误类型映射(/v1/messages 返回 {type:'error',error:{type,message}} 客户端才可识别)
+function anthErrType(status) {
+  return status === 429 ? 'rate_limit_error' : status === 401 || status === 403 ? 'authentication_error' : status === 400 ? 'invalid_request_error' : 'api_error';
 }
 function readBody(req, res, cb) {
   let body = '';
@@ -615,12 +674,27 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify(openAIToAnthropic(oai, clientModel)));
           return;
         }
+        if (isAnthropic) {
+          // 上游非 2xx:翻译为 Anthropic 错误格式(Claude Code 只认 {type:'error',error:{type,message}})
+          const t = await up.text().catch(() => '');
+          let emsg = t.slice(0, 500);
+          try { const ej = JSON.parse(t); emsg = (ej.error && (ej.error.message || ej.error)) || ej.message || emsg; } catch {}
+          res.writeHead(up.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: anthErrType(up.status), message: `upstream ${up.status}: ${emsg}` } }));
+          return;
+        }
         res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
         if (up.body) { for await (const chunk of up.body) res.write(chunk); }
         res.end();
       } catch (e) {
+        const emsg = String((e && e.message) || e);
+        if (isAnthropic) {
+          if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: emsg } }));
+          return;
+        }
         if (!res.headersSent) res.writeHead(502);
-        res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+        res.end(JSON.stringify({ error: emsg }));
       }
     });
     return;

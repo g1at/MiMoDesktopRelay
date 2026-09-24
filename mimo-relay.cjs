@@ -612,7 +612,7 @@ function anthErrType(status) {
 }
 function readBody(req, res, cb) {
   let body = '';
-  req.on('data', c => { body += c; if (body.length > 4e6) req.destroy(); });
+  req.on('data', c => { body += c; if (body.length > 50e6) req.destroy(); }); // 50MB:base64 图片场景放宽
   req.on('end', () => {
     let p;
     try { p = JSON.parse(body || '{}'); } catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }

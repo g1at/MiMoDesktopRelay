@@ -225,12 +225,21 @@ async function refreshSession(allowReextract) {
   return refreshing;
 }
 async function upstream(payload, retried) {
-  const resp = await fetch(UPSTREAM, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Cookie: cookieHeader('mimo-server-cn.xiaomimimo.com') },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(180000)
-  });
+  // 超时分两段:连接+首字节 180s(云端排队容忍);拿到响应头后解除总时限,
+  // 流式 body 由 anthropicStream 的 idle 看门狗保护,非流式 body 由调用方 race 超时保护。
+  // 旧实现 AbortSignal.timeout 覆盖整个流式生命周期,长响应 180s 必断连。
+  const ctrl = new AbortController();
+  const ttfb = setTimeout(() => ctrl.abort(), 180000);
+  let resp;
+  try {
+    resp = await fetch(UPSTREAM, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookieHeader('mimo-server-cn.xiaomimimo.com') },
+      body: JSON.stringify(payload),
+      signal: ctrl.signal
+    });
+  } catch (e) { clearTimeout(ttfb); throw e; }
+  clearTimeout(ttfb);
   if ((resp.status === 401 || resp.status === 403) && !retried) {
     log('upstream ' + resp.status + ' -> refreshing session and retrying');
     await refreshSession();
@@ -240,6 +249,9 @@ async function upstream(payload, retried) {
 }
 
 // ---------- Anthropic <-> OpenAI 转换 ----------
+function mapFinishReason(fr) {
+  return { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use', content_filter: 'refusal' }[fr] || 'end_turn';
+}
 function anthropicToOpenAI(body) {
   const msgs = [];
   if (body.system) {
@@ -248,30 +260,65 @@ function anthropicToOpenAI(body) {
     if (sys) msgs.push({ role: 'system', content: sys });
   }
   for (const m of body.messages || []) {
-    const role = m.role === 'assistant' ? 'assistant' : 'user';
-    let c = m.content;
-    if (Array.isArray(c)) {
-      const parts = [];
-      for (const b of c) {
-        if (!b) continue;
-        if (b.type === 'text') parts.push(b.text || '');
-        else if (b.type === 'tool_result') parts.push('[tool_result] ' + (typeof b.content === 'string' ? b.content : JSON.stringify(b.content || '').slice(0, 2000)));
-        else if (b.type === 'tool_use') parts.push(`[tool_use ${b.name}] ` + JSON.stringify(b.input || {}));
+    if (m.role === 'assistant') {
+      let text = ''; const toolCalls = [];
+      if (typeof m.content === 'string') text = m.content;
+      else if (Array.isArray(m.content)) {
+        for (const b of m.content) {
+          if (!b) continue;
+          if (b.type === 'text') text += (text ? '\n' : '') + (b.text || '');
+          else if (b.type === 'tool_use') toolCalls.push({ id: b.id, type: 'function', function: { name: b.name, arguments: JSON.stringify(b.input || {}) } });
+        }
       }
-      c = parts.join('\n');
+      const msg = { role: 'assistant', content: text || null };
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      msgs.push(msg);
+      continue;
     }
-    msgs.push({ role, content: String(c ?? '') });
+    // user 消息:可能混有 text 与 tool_result;tool_result 拆成独立 role:tool 消息(OpenAI 语序)
+    if (Array.isArray(m.content)) {
+      const texts = [];
+      for (const b of m.content) {
+        if (!b) continue;
+        if (b.type === 'tool_result') {
+          let c = b.content;
+          if (Array.isArray(c)) c = c.map(x => (x && x.text) || (typeof x === 'string' ? x : '')).filter(Boolean).join('\n');
+          msgs.push({ role: 'tool', tool_call_id: b.tool_use_id, content: String(c ?? '') });
+        } else if (b.type === 'text') texts.push(b.text || '');
+        else if (b.type === 'image') texts.push('[image]');
+      }
+      if (texts.length) msgs.push({ role: 'user', content: texts.join('\n') });
+    } else {
+      msgs.push({ role: 'user', content: String(m.content ?? '') });
+    }
   }
-  return { model: resolveModel(body.model), messages: msgs, stream: !!body.stream };
+  const out = { model: resolveModel(body.model), messages: msgs, stream: !!body.stream };
+  if (body.max_tokens != null) out.max_tokens = body.max_tokens;
+  if (body.temperature != null) out.temperature = body.temperature;
+  if (body.top_p != null) out.top_p = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences;
+  if (Array.isArray(body.tools) && body.tools.length) {
+    out.tools = body.tools.map(t => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.input_schema || { type: 'object', properties: {} } } }));
+    const tc = body.tool_choice;
+    if (tc) out.tool_choice = tc.type === 'auto' ? 'auto' : tc.type === 'any' ? 'required' : (tc.type === 'tool' && tc.name ? { type: 'function', function: { name: tc.name } } : 'auto');
+  }
+  return out;
 }
 function openAIToAnthropic(oai, clientModel) {
   const choice = (oai.choices && oai.choices[0]) || {};
-  const text = (choice.message && choice.message.content) || '';
+  const message = choice.message || {};
+  const content = [];
+  if (message.content) content.push({ type: 'text', text: message.content });
+  for (const tc of message.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch {}
+    content.push({ type: 'tool_use', id: tc.id || ('toolu_' + crypto.randomBytes(8).toString('hex')), name: (tc.function && tc.function.name) || '', input });
+  }
   return {
     id: 'msg_' + crypto.randomBytes(12).toString('hex'),
     type: 'message', role: 'assistant', model: clientModel || REAL_MODEL,
-    content: [{ type: 'text', text }],
-    stop_reason: choice.finish_reason === 'stop' ? 'end_turn' : (choice.finish_reason || 'end_turn'),
+    content,
+    stop_reason: mapFinishReason(choice.finish_reason),
     stop_sequence: null,
     usage: { input_tokens: (oai.usage && oai.usage.prompt_tokens) || 0, output_tokens: (oai.usage && oai.usage.completion_tokens) || 0 }
   };
@@ -281,31 +328,68 @@ async function anthropicStream(res, up, clientModel) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   const msgId = 'msg_' + crypto.randomBytes(12).toString('hex');
   sseWrite(res, 'message_start', { type: 'message_start', message: { id: msgId, type: 'message', role: 'assistant', model: clientModel || REAL_MODEL, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-  sseWrite(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
   let outTokens = 0, inTokens = 0, stopReason = 'end_turn';
-  const decoder = new TextDecoder();
-  let buf = '', done = false;
-  for await (const chunk of up.body) {
-    buf += decoder.decode(chunk, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (data === '[DONE]') { done = true; break; }
-      let j; try { j = JSON.parse(data); } catch { continue; }
-      const ch = (j.choices && j.choices[0]) || {};
-      const delta = ch.delta && ch.delta.content;
-      if (delta) sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta } });
-      if (ch.finish_reason) stopReason = ch.finish_reason === 'stop' ? 'end_turn' : ch.finish_reason;
-      if (j.usage) { inTokens = j.usage.prompt_tokens || inTokens; outTokens = j.usage.completion_tokens || outTokens; }
+  // block 状态机:任意时刻最多一个 block 开着;text 与 tool_use 切换时先关后开
+  let blockOpen = false, blockIndex = -1;
+  const tcMap = new Map(); // OpenAI tool_calls index -> Anthropic blockIndex
+  const closeBlock = () => {
+    if (blockOpen) { try { sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex }); } catch {} blockOpen = false; }
+  };
+  // 保活与看门狗:云端长推理期间定期 ping;超过 150s 无任何数据则判死断开(告别假断连)
+  let lastChunk = Date.now(), finished = false;
+  const pingTimer = setInterval(() => { try { sseWrite(res, 'ping', { type: 'ping' }); } catch {} }, 15000);
+  const idleTimer = setInterval(() => {
+    if (!finished && Date.now() - lastChunk > 150000) {
+      log('upstream stream idle >150s, closing');
+      try { sseWrite(res, 'error', { type: 'error', error: { type: 'timeout_error', message: 'upstream idle timeout' } }); sseWrite(res, 'message_stop', { type: 'message_stop' }); res.end(); } catch {}
+      try { up.body.destroy(); } catch {}
     }
-    if (done) break;
-  }
-  sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-  sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inTokens, output_tokens: outTokens } });
-  sseWrite(res, 'message_stop', { type: 'message_stop' });
-  res.end();
+  }, 5000);
+  try {
+    const decoder = new TextDecoder();
+    let buf = '', done = false;
+    for await (const chunk of up.body) {
+      lastChunk = Date.now();
+      buf += decoder.decode(chunk, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') { done = true; break; }
+        let j; try { j = JSON.parse(data); } catch { continue; }
+        const ch = (j.choices && j.choices[0]) || {};
+        const delta = ch.delta || {};
+        if (delta.content) {
+          if (!blockOpen) { blockIndex++; blockOpen = true; sseWrite(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } }); }
+          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } });
+        }
+        for (const tc of delta.tool_calls || []) {
+          const ti = tc.index != null ? tc.index : 0;
+          let entry = tcMap.get(ti);
+          if (!entry) { closeBlock(); blockIndex++; entry = { blockIndex, started: false }; tcMap.set(ti, entry); }
+          if (!entry.started && (tc.id || (tc.function && tc.function.name))) {
+            sseWrite(res, 'content_block_start', { type: 'content_block_start', index: entry.blockIndex, content_block: { type: 'tool_use', id: tc.id || ('toolu_' + crypto.randomBytes(8).toString('hex')), name: (tc.function && tc.function.name) || '', input: {} } });
+            entry.started = true; blockOpen = true; blockIndex = entry.blockIndex;
+          }
+          if (entry.started && tc.function && tc.function.arguments) {
+            sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: entry.blockIndex, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } });
+          }
+        }
+        if (ch.finish_reason) stopReason = mapFinishReason(ch.finish_reason);
+        if (j.usage) { inTokens = j.usage.prompt_tokens || inTokens; outTokens = j.usage.completion_tokens || outTokens; }
+      }
+      if (done) break;
+    }
+  } catch (e) { log('stream error: ' + e.message); }
+  finished = true;
+  clearInterval(pingTimer); clearInterval(idleTimer);
+  closeBlock();
+  try {
+    sseWrite(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inTokens, output_tokens: outTokens } });
+    sseWrite(res, 'message_stop', { type: 'message_stop' });
+    res.end();
+  } catch {}
 }
 function roughCountTokens(body) {
   let chars = 0;
@@ -349,7 +433,7 @@ const server = http.createServer(async (req, res) => {
         const up = await upstream(oaiPayload);
         if (isAnthropic && up.ok && oaiPayload.stream) { await anthropicStream(res, up, clientModel); return; }
         if (isAnthropic && up.ok) {
-          const oai = await up.json();
+          const oai = await Promise.race([up.json(), new Promise((_, rej) => setTimeout(() => rej(new Error('upstream body timeout (600s)')), 600000))]);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(openAIToAnthropic(oai, clientModel)));
           return;

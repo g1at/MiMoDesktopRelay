@@ -28,6 +28,20 @@ curl http://127.0.0.1:8317/health
 |---|---|
 | OpenAI 兼容工具 | `base_url=http://127.0.0.1:8317/v1`,`api_key` 任意非空 |
 | Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8317`,`ANTHROPIC_AUTH_TOKEN` 任意非空 |
+| Codex CLI(新版,已移除 `wire_api="chat"`) | `~/.codex/config.toml` 加 provider:见下 |
+
+Codex 配置示例(`wire_api` 必须为 `responses`,relay 已实现该转换):
+
+```toml
+model = "mimo-pro"
+model_provider = "mimo"
+
+[model_providers.mimo]
+name = "MiMo"
+base_url = "http://127.0.0.1:8317/v1"
+wire_api = "responses"
+env_key = "MIMO_API_KEY"   # 任意非空值,如 set MIMO_API_KEY=mimo
+```
 
 模型名填 `mimo-pro`(默认,推理主力)或 `mimo-flash`(快速版);云端实际执行为 mimo-v2.6-pro / mimo-v2.6-flash。填其他名字不会报错,自动回落到 `mimo-pro`。
 
@@ -36,8 +50,9 @@ curl http://127.0.0.1:8317/health
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/v1/models` | 模型列表(别名) |
-| POST | `/v1/chat/completions` | OpenAI 聊天,流式/非流式 |
-| POST | `/v1/messages` | Anthropic Messages,流式 SSE/非流式 |
+| POST | `/v1/chat/completions` | OpenAI 聊天,流式/非流式,tools 透传 |
+| POST | `/v1/responses` | OpenAI Responses API(Codex 新版),流式/非流式,function_call 完整支持 |
+| POST | `/v1/messages` | Anthropic Messages,流式 SSE/非流式,完整 tool_use 支持 |
 | POST | `/v1/messages/count_tokens` | 粗略 token 估算 |
 | GET | `/health` | 状态(含凭据来源) |
 

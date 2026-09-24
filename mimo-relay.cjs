@@ -391,6 +391,160 @@ async function anthropicStream(res, up, clientModel) {
     res.end();
   } catch {}
 }
+// ---------- OpenAI Responses API 转换(新版 Codex 强制走 /v1/responses,已移除 chat 支持) ----------
+function responsesToOpenAI(body) {
+  const msgs = [];
+  if (body.instructions) msgs.push({ role: 'system', content: body.instructions });
+  const input = Array.isArray(body.input) ? body.input : (body.input ? [body.input] : []);
+  for (const item of input) {
+    if (typeof item === 'string') { msgs.push({ role: 'user', content: item }); continue; }
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'function_call') {
+      msgs.push({ role: 'assistant', content: null, tool_calls: [{ id: item.call_id || item.id, type: 'function', function: { name: item.name, arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}) } }] });
+      continue;
+    }
+    if (item.type === 'function_call_output') {
+      msgs.push({ role: 'tool', tool_call_id: item.call_id, content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '') });
+      continue;
+    }
+    if (item.type === 'message' || item.role) {
+      const role = item.role === 'assistant' ? 'assistant' : (item.role === 'system' || item.role === 'developer' ? 'system' : 'user');
+      let c = item.content;
+      if (Array.isArray(c)) {
+        const texts = [];
+        for (const p of c) {
+          if (!p) continue;
+          if (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text') texts.push(p.text || '');
+          else if (p.type === 'input_image') texts.push('[image]');
+        }
+        c = texts.join('\n');
+      }
+      msgs.push({ role, content: String(c ?? '') });
+    }
+  }
+  const out = { model: resolveModel(body.model), messages: msgs, stream: !!body.stream };
+  if (body.max_output_tokens != null) out.max_tokens = body.max_output_tokens;
+  if (body.temperature != null) out.temperature = body.temperature;
+  if (body.top_p != null) out.top_p = body.top_p;
+  if (Array.isArray(body.tools) && body.tools.length) {
+    out.tools = body.tools.filter(t => t && t.type === 'function').map(t => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.parameters || { type: 'object', properties: {} } } }));
+    if (typeof body.tool_choice === 'string') out.tool_choice = body.tool_choice;
+  }
+  return out;
+}
+function buildResponseObj(id, clientModel, status, output, usage) {
+  return {
+    id, object: 'response', created_at: Math.floor(Date.now() / 1000), status,
+    model: clientModel || REAL_MODEL, output,
+    usage: usage ? { input_tokens: usage.input_tokens || 0, output_tokens: usage.output_tokens || 0, total_tokens: (usage.input_tokens || 0) + (usage.output_tokens || 0) } : undefined
+  };
+}
+function openAIToResponses(oai, clientModel) {
+  const choice = (oai.choices && oai.choices[0]) || {};
+  const message = choice.message || {};
+  const output = [];
+  if (message.content) {
+    output.push({ type: 'message', id: 'msg_' + crypto.randomBytes(8).toString('hex'), role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: message.content, annotations: [] }] });
+  }
+  for (const tc of message.tool_calls || []) {
+    output.push({ type: 'function_call', id: 'fc_' + crypto.randomBytes(8).toString('hex'), call_id: tc.id, name: (tc.function && tc.function.name) || '', arguments: (tc.function && tc.function.arguments) || '{}', status: 'completed' });
+  }
+  return buildResponseObj('resp_' + crypto.randomBytes(12).toString('hex'), clientModel, 'completed', output,
+    { input_tokens: (oai.usage && oai.usage.prompt_tokens) || 0, output_tokens: (oai.usage && oai.usage.completion_tokens) || 0 });
+}
+async function responsesStream(res, up, clientModel) {
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  const respId = 'resp_' + crypto.randomBytes(12).toString('hex');
+  const send = (ev, data) => { try { sseWrite(res, ev, data); } catch {} };
+  send('response.created', { type: 'response.created', response: buildResponseObj(respId, clientModel, 'in_progress', [], null) });
+  // 状态机:上游 text / tool_calls 增量 -> Responses 事件;任意时刻最多一个 item 开着
+  let openIdx = -1, openKind = null; // 'message' | 'function_call'
+  let textBuf = '', textItemId = '';
+  const tcMap = new Map(); // openai tool_calls index -> {outputIndex, itemId, callId, name, args}
+  let outTokens = 0, inTokens = 0;
+  const doneItems = [];
+  const closeMessage = () => {
+    if (openKind !== 'message') return;
+    send('response.output_text.done', { type: 'response.output_text.done', output_index: openIdx, content_index: 0, text: textBuf });
+    send('response.content_part.done', { type: 'response.content_part.done', output_index: openIdx, content_index: 0, part: { type: 'output_text', text: textBuf, annotations: [] } });
+    const item = { type: 'message', id: textItemId, role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: textBuf, annotations: [] }] };
+    send('response.output_item.done', { type: 'response.output_item.done', output_index: openIdx, item });
+    doneItems.push(item);
+    openKind = null;
+  };
+  const closeCall = (e) => {
+    send('response.function_call_arguments.done', { type: 'response.function_call_arguments.done', output_index: e.outputIndex, arguments: e.args });
+    const item = { type: 'function_call', id: e.itemId, call_id: e.callId, name: e.name, arguments: e.args, status: 'completed' };
+    send('response.output_item.done', { type: 'response.output_item.done', output_index: e.outputIndex, item });
+    doneItems.push(item);
+    e.closed = true;
+  };
+  let lastChunk = Date.now(), finished = false;
+  const pingTimer = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000); // SSE 注释保活
+  const idleTimer = setInterval(() => {
+    if (!finished && Date.now() - lastChunk > 150000) {
+      log('upstream stream idle >150s, closing');
+      send('response.failed', { type: 'response.failed', response: buildResponseObj(respId, clientModel, 'failed', doneItems, null) });
+      try { res.end(); } catch {}
+      try { up.body.destroy(); } catch {}
+    }
+  }, 5000);
+  try {
+    const decoder = new TextDecoder();
+    let buf = '', done = false;
+    for await (const chunk of up.body) {
+      lastChunk = Date.now();
+      buf += decoder.decode(chunk, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') { done = true; break; }
+        let j; try { j = JSON.parse(data); } catch { continue; }
+        const ch = (j.choices && j.choices[0]) || {};
+        const delta = ch.delta || {};
+        if (delta.content) {
+          if (openKind !== 'message') {
+            for (const e of tcMap.values()) if (!e.closed) closeCall(e);
+            openIdx++; openKind = 'message'; textBuf = ''; textItemId = 'msg_' + crypto.randomBytes(8).toString('hex');
+            send('response.output_item.added', { type: 'response.output_item.added', output_index: openIdx, item: { type: 'message', id: textItemId, role: 'assistant', status: 'in_progress', content: [] } });
+            send('response.content_part.added', { type: 'response.content_part.added', output_index: openIdx, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+          }
+          textBuf += delta.content;
+          send('response.output_text.delta', { type: 'response.output_text.delta', output_index: openIdx, content_index: 0, delta: delta.content });
+        }
+        for (const tc of delta.tool_calls || []) {
+          const ti = tc.index != null ? tc.index : 0;
+          let entry = tcMap.get(ti);
+          if (!entry) {
+            closeMessage();
+            openIdx++;
+            entry = { outputIndex: openIdx, itemId: 'fc_' + crypto.randomBytes(8).toString('hex'), callId: tc.id || ('call_' + crypto.randomBytes(8).toString('hex')), name: (tc.function && tc.function.name) || '', args: '', closed: false };
+            tcMap.set(ti, entry);
+            openKind = 'function_call';
+            send('response.output_item.added', { type: 'response.output_item.added', output_index: openIdx, item: { type: 'function_call', id: entry.itemId, call_id: entry.callId, name: entry.name, arguments: '', status: 'in_progress' } });
+          }
+          if (tc.id) entry.callId = tc.id;
+          if (tc.function && tc.function.name) entry.name = tc.function.name;
+          if (tc.function && tc.function.arguments) {
+            entry.args += tc.function.arguments;
+            send('response.function_call_arguments.delta', { type: 'response.function_call_arguments.delta', output_index: entry.outputIndex, delta: tc.function.arguments });
+          }
+        }
+        if (j.usage) { inTokens = j.usage.prompt_tokens || inTokens; outTokens = j.usage.completion_tokens || outTokens; }
+      }
+      if (done) break;
+    }
+  } catch (e) { log('stream error: ' + e.message); }
+  finished = true;
+  clearInterval(pingTimer); clearInterval(idleTimer);
+  closeMessage();
+  for (const e of tcMap.values()) if (!e.closed) closeCall(e);
+  send('response.completed', { type: 'response.completed', response: buildResponseObj(respId, clientModel, 'completed', doneItems, { input_tokens: inTokens, output_tokens: outTokens }) });
+  try { res.end(); } catch {}
+}
+
 function roughCountTokens(body) {
   let chars = 0;
   if (body.system) chars += typeof body.system === 'string' ? body.system.length : JSON.stringify(body.system).length;
@@ -412,7 +566,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
   if (req.method === 'GET' && url === '/v1/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ object: 'list', data: MODEL_ALIASES.map(id => ({ id, object: 'model', owned_by: 'xiaomi-mimo-relay' })) }));
+    res.end(JSON.stringify({ object: 'list', data: MODEL_ALIASES.map(id => ({ id, object: 'model', created: 1700000000, owned_by: 'xiaomi-mimo-relay' })) }));
     return;
   }
   if (req.method === 'GET' && (url === '/health' || url === '/v1/health')) {
@@ -422,6 +576,29 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
     readBody(req, res, p => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(roughCountTokens(p))); });
+    return;
+  }
+  if (req.method === 'POST' && url === '/v1/responses') {
+    readBody(req, res, async payload => {
+      const clientModel = typeof payload.model === 'string' ? payload.model : REAL_MODEL;
+      const oaiPayload = responsesToOpenAI(payload);
+      try {
+        const up = await upstream(oaiPayload);
+        if (up.ok && oaiPayload.stream) { await responsesStream(res, up, clientModel); return; }
+        if (up.ok) {
+          const oai = await Promise.race([up.json(), new Promise((_, rej) => setTimeout(() => rej(new Error('upstream body timeout (600s)')), 600000))]);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(openAIToResponses(oai, clientModel)));
+          return;
+        }
+        res.writeHead(up.status, { 'Content-Type': up.headers.get('content-type') || 'application/json' });
+        if (up.body) { for await (const chunk of up.body) res.write(chunk); }
+        res.end();
+      } catch (e) {
+        if (!res.headersSent) res.writeHead(502);
+        res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+      }
+    });
     return;
   }
   if (req.method === 'POST' && (url === '/v1/messages' || url === '/v1/chat/completions')) {

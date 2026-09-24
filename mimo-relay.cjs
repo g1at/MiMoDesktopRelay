@@ -111,8 +111,10 @@ async function extractCredentials() {
   ];
   const { DatabaseSync } = require('node:sqlite');
   const creds = {};
+  let tried = 0, locked = 0;
   for (const src of candidates) {
     if (!fs.existsSync(src)) continue;
+    tried++;
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mimo-relay-'));
     const dst = path.join(tmp, 'Cookies');
     try {
@@ -129,10 +131,19 @@ async function extractCredentials() {
         if (!plain && r.encrypted_value) plain = decryptV10(Buffer.from(r.encrypted_value), mk) || '';
         if (plain && (r.name === 'passToken' || r.name === 'userId' || r.name === 'cUserId')) creds[r.name] = plain;
       }
-    } catch (e) { log('read cookies db failed: ' + src + ' -> ' + e.message); }
+    } catch (e) {
+      if (e.code === 'EBUSY' || e.code === 'EPERM') locked++;
+      log('read cookies db failed: ' + src + ' -> ' + e.message);
+    }
     finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {} }
   }
-  if (!creds.passToken) throw new Error('未能提取 passToken(请确认 MiMo Desktop 已安装并登录)');
+  if (!creds.passToken) {
+    // 任一候选库被独占锁(App 运行中)就可能藏有 passToken,报锁定而非引导检查安装/登录
+    if (locked > 0) {
+      throw new Error('Cookies 数据库被运行中的 MiMo Desktop 独占锁定(预期行为,无需退出 App)');
+    }
+    throw new Error('未能提取 passToken(请确认 MiMo Desktop 已安装并登录)');
+  }
   return creds; // 仅存内存
 }
 

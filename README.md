@@ -41,6 +41,17 @@ curl http://127.0.0.1:8317/health
 | POST | `/v1/messages/count_tokens` | 粗略 token 估算 |
 | GET | `/health` | 状态(含凭据来源) |
 
+## Claude Code 适配细节
+
+`/v1/messages` 面向 Claude Code 全量对齐(在上游能力范围内):
+
+- **工具调用**:`tools`/`tool_choice` 双向映射,`tool_use`/`tool_result` 历史还原为 OpenAI `tool_calls`/`role:tool`;流式 `input_json_delta` 增量下发
+- **思考链**:上游 `reasoning_content` → `thinking` 块(带 signature);流式 `thinking_delta` + `signature_delta`;请求侧 `thinking.budget_tokens` → `reasoning_effort`
+- **多模态**:`image` 块(base64/url)→ OpenAI `image_url` parts(mimo-pro 实测可识图)
+- **用量**:`prompt_tokens_details.cached_tokens` → `cache_read_input_tokens`/`cache_creation_input_tokens`
+- **健壮性**:SSE 周期 `ping` + 150s 空闲看门狗;上游非 2xx 与中途异常翻译为 Anthropic `error` 事件/`{type:'error'}` 响应
+- **不支持的块**:服务端工具(web_search 等)丢弃,`document` 块降级为占位文本
+
 ## 自动维护
 
 - 上游 401/403 → 自动重刷会话并重试一次
